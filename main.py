@@ -150,7 +150,6 @@ class Forest:
         leaves = self.get_leaves()
         for i in range(len(leaves)-1):
             if abs(leaves[i].depth - leaves[i+1].depth) > 1:
-                breakpoint()
                 raise ValueError("Forest not properly balanced!")
 
     def regrid(self, refine_threshold, deref_ratio):
@@ -173,17 +172,14 @@ class Forest:
             if flags[leaf] != -1:
                 continue
 
-            try:
-                if leaf.depth == 0:
-                    flags[leaf] = 0
-                # Don't coarsen if sibling isn't a leaf
-                elif not leaf.parent.left.is_leaf or not leaf.parent.right.is_leaf:
-                    flags[leaf] = 0
-                # Don't coarsen unless both children (which are both leaves) want to coarsen
-                elif flags[leaf.parent.left] != -1 or flags[leaf.parent.right] != -1:
-                    flags[leaf] = 0
-            except:
-                breakpoint()
+            if leaf.depth == 0:
+                flags[leaf] = 0
+            # Don't coarsen if sibling isn't a leaf
+            elif not leaf.parent.left.is_leaf or not leaf.parent.right.is_leaf:
+                flags[leaf] = 0
+            # Don't coarsen unless both children (which are both leaves) want to coarsen
+            elif flags[leaf.parent.left] != -1 or flags[leaf.parent.right] != -1:
+                flags[leaf] = 0
 
         # NOTE(cmo): Enforce 2:1 balance
         changed = True
