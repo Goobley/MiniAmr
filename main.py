@@ -270,6 +270,17 @@ def enforce_flux_consistency(leaves, fluxes):
             if right.depth > leaf.depth:
                 fluxes[i][:, -(NUM_GHOST+1)] = fluxes[i+1][:, NUM_GHOST]
 
+def enforce_flux_consistency_vector(leaves, depths, fluxes):
+    # NOTE(cmo): This is only correct because we don't subcycle in time for the fine grids
+    for i in range(leaves.shape[2]):
+        if i > 0:
+            if depths[i-1] > depths[i]:
+                fluxes[:, NUM_GHOST, i] = fluxes[:, -(NUM_GHOST+1), i-1]
+
+        if i < leaves.shape[2] - 1:
+            if depths[i+1] > depths[i]:
+                fluxes[:, -(NUM_GHOST+1), i] = fluxes[:, NUM_GHOST, i+1]
+
 
 def fill_ghosts(leaves: List[Block]):
     for i in range(len(leaves)):
@@ -354,14 +365,20 @@ def rusanov_flux_with_padding(wL, wR, gamma: float=DEFAULT_GAMMA):
         np.roll(wL, -1, axis=1),
         gamma=gamma
     )
-    full_flux = np.empty((wL.shape[0], wL.shape[1]+1))
+    if wL.ndim == 2:
+        full_flux = np.empty((wL.shape[0], wL.shape[1]+1))
+    else:
+        full_flux = np.empty((wL.shape[0], wL.shape[1]+1, wL.shape[2]))
     full_flux[:, 1:] = unpadded_flux
     full_flux[:, :NUM_GHOST] = 0.0
     full_flux[:, -NUM_GHOST:] = 0.0
     return full_flux
 
 def run_step(leaves, dt, bc_modes, gamma: float=DEFAULT_GAMMA):
+    scalar_grid = False
     U_old = [l.U.copy() for l in leaves]
+    if not scalar_grid:
+        U_old_stack = np.stack(U_old, axis=-1)
 
     dt_scheme = [dt, 0.5 * dt]
 
@@ -369,28 +386,54 @@ def run_step(leaves, dt, bc_modes, gamma: float=DEFAULT_GAMMA):
         fluxes = []
         fill_ghosts(leaves)
         set_bcs(leaves, dt_sub, bc_modes)
-        for leaf in leaves:
-            w = cons_to_prim(leaf.U, gamma=gamma)
-            # Relative to cells
+        if scalar_grid:
+            for leaf in leaves:
+                w = cons_to_prim(leaf.U, gamma=gamma)
+                # Relative to cells
+                wL, wR = reconstruct_plm(w)
+                # wL, wR = reconstruct_fog(w)
+                interface_flux = rusanov_flux_with_padding(wL, wR, gamma=gamma)
+                fluxes.append(interface_flux)
+
+            enforce_flux_consistency(leaves, fluxes)
+
+            for idx, block in enumerate(leaves):
+                dx = block.dx
+                flux = fluxes[idx]
+                flux_div = flux[:, NUM_GHOST+1:-NUM_GHOST] - flux[:, NUM_GHOST:-(NUM_GHOST+1)]
+                # TODO(cmo): Source terms
+                flux_update = - dt_sub / dx * flux_div
+                if substep == 0:
+                    block.U[:, NUM_GHOST:-NUM_GHOST] += flux_update
+                else:
+                    block.U[:, NUM_GHOST:-NUM_GHOST] = 0.5 * (
+                        U_old[idx][:, NUM_GHOST:-NUM_GHOST] + block.U[:, NUM_GHOST:-NUM_GHOST]
+                    ) + flux_update
+        else:
+            # NOTE(cmo): This isn't a super awesome layout for SIMD etc, but
+            # it's the minimum changes for vectorising
+            leaf_stack = np.stack([l.U for l in leaves], axis=-1)
+            depths = np.array([l.depth for l in leaves], dtype=np.int32)
+            dxs = np.array([l.dx for l in leaves])
+            w = cons_to_prim(leaf_stack, gamma=gamma)
             wL, wR = reconstruct_plm(w)
-            # wL, wR = reconstruct_fog(w)
-            interface_flux = rusanov_flux_with_padding(wL, wR, gamma=gamma)
-            fluxes.append(interface_flux)
+            flux_stack = rusanov_flux_with_padding(wL, wR, gamma=gamma)
 
-        enforce_flux_consistency(leaves, fluxes)
+            enforce_flux_consistency_vector(leaf_stack, depths, flux_stack)
 
-        for idx, block in enumerate(leaves):
-            dx = block.dx
-            flux = fluxes[idx]
-            flux_div = flux[:, NUM_GHOST+1:-NUM_GHOST] - flux[:, NUM_GHOST:-(NUM_GHOST+1)]
+            flux_div = flux_stack[:, NUM_GHOST+1:-NUM_GHOST, :] - flux_stack[:, NUM_GHOST:-(NUM_GHOST+1), :]
             # TODO(cmo): Source terms
-            flux_update = - dt_sub / dx * flux_div
+            flux_update = - dt_sub / dxs[None, None, :] * flux_div
             if substep == 0:
-                block.U[:, NUM_GHOST:-NUM_GHOST] += flux_update
+                leaf_stack[:, NUM_GHOST:-NUM_GHOST, :] += flux_update
             else:
-                block.U[:, NUM_GHOST:-NUM_GHOST] = 0.5 * (
-                    U_old[idx][:, NUM_GHOST:-NUM_GHOST] + block.U[:, NUM_GHOST:-NUM_GHOST]
+                leaf_stack[:, NUM_GHOST:-NUM_GHOST, :] = 0.5 * (
+                    U_old_stack[:, NUM_GHOST:-NUM_GHOST, :] + leaf_stack[:, NUM_GHOST:-NUM_GHOST]
                 ) + flux_update
+            # NOTE(cmo): This copy is gonna be sloooooow
+            for i, block in enumerate(leaves):
+                block.U[...] = leaf_stack[:, :, i]
+
 
 def sod_ics(x, gamma=DEFAULT_GAMMA):
     w = np.stack([
