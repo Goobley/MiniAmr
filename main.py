@@ -1,24 +1,19 @@
+from dataclasses import dataclass
 from typing import List, Optional
 import numpy as np
 import matplotlib.pyplot as plt
+
+from hyperbolic_thermal_conduction import compute_heatf_source
 try:
     get_ipython().run_line_magic("matplotlib", "")
 except:
     plt.ion()
 
 import numpy as np
-from euler import DEFAULT_GAMMA, cons_to_prim, prim_to_cons, prim_to_flux, rusanov_flux, sound_speed
+from euler import DEFAULT_GAMMA, cons_to_prim, prim_to_cons, prim_to_flux, rusanov_flux, sound_speed, temperature_si
 from reconstruct import reconstruct_fog, reconstruct_plm, slope_limiter
 
-NUM_EQ = 3
-NUM_GHOST = 2
-
-ERR_THRESH = 0.2
-DEREF_RATIO = 0.125
-REGRID_FREQ = 5
-
-SYMMETRIC_BC = 0
-REFLECTING_BC = 1
+from config import *
 
 class Block:
     def __init__(self, depth, max_depth, M, x0, x1, parent=None):
@@ -29,7 +24,7 @@ class Block:
         self.x1 = x1
         self.dx = (x1 - x0) / M
 
-        self.U = np.zeros((NUM_EQ, M + 2 * NUM_GHOST))
+        self.Q = np.zeros((NUM_EQ, M + 2 * NUM_GHOST))
 
         # Child blocks (None if leaf)
         self.left: Optional[Block] = None
@@ -42,7 +37,7 @@ class Block:
 
     @property
     def x_pos(self):
-        return (self.x0 - NUM_GHOST * self.dx) + np.arange(self.U.shape[1]) * self.dx
+        return (self.x0 - NUM_GHOST * self.dx) + np.arange(self.Q.shape[1]) * self.dx
 
     def refine(self):
         if self.depth == self.max_depth:
@@ -53,27 +48,27 @@ class Block:
         self.left = Block(self.depth+1, self.max_depth, self.M, self.x0, xm, parent=self)
         self.right = Block(self.depth+1, self.max_depth, self.M, xm, self.x1, parent=self)
 
-        half_grid = self.U.shape[1] // 2
+        half_grid = self.Q.shape[1] // 2
 
         # Prolongation -- ghosts aren't handled correctly, but that's fine, they
         # get filled before each step and also before CFL calculation
-        duL = self.U[:, 1:-1] - self.U[:, :-2]
-        duR = self.U[:, 2:] - self.U[:, 1:-1]
-        delta = np.zeros_like(self.U)
+        duL = self.Q[:, 1:-1] - self.Q[:, :-2]
+        duR = self.Q[:, 2:] - self.Q[:, 1:-1]
+        delta = np.zeros_like(self.Q)
         delta[:, 1:-1] = slope_limiter(duL, duR)
 
-        self.left.U[:, NUM_GHOST:-NUM_GHOST:2] = (
-            self.U[:, NUM_GHOST:half_grid] - 0.25 * delta[:, NUM_GHOST:half_grid]
+        self.left.Q[:, NUM_GHOST:-NUM_GHOST:2] = (
+            self.Q[:, NUM_GHOST:half_grid] - 0.25 * delta[:, NUM_GHOST:half_grid]
         )
-        self.left.U[:, NUM_GHOST+1:-NUM_GHOST:2] = (
-            self.U[:, NUM_GHOST:half_grid] + 0.25 * delta[:, NUM_GHOST:half_grid]
+        self.left.Q[:, NUM_GHOST+1:-NUM_GHOST:2] = (
+            self.Q[:, NUM_GHOST:half_grid] + 0.25 * delta[:, NUM_GHOST:half_grid]
         )
 
-        self.right.U[:, NUM_GHOST:-NUM_GHOST:2] = (
-            self.U[:, half_grid:-NUM_GHOST] - 0.25 * delta[:, half_grid:-NUM_GHOST]
+        self.right.Q[:, NUM_GHOST:-NUM_GHOST:2] = (
+            self.Q[:, half_grid:-NUM_GHOST] - 0.25 * delta[:, half_grid:-NUM_GHOST]
         )
-        self.right.U[:, NUM_GHOST+1:-NUM_GHOST:2] = (
-            self.U[:, half_grid:-NUM_GHOST] + 0.25 * delta[:, half_grid:-NUM_GHOST]
+        self.right.Q[:, NUM_GHOST+1:-NUM_GHOST:2] = (
+            self.Q[:, half_grid:-NUM_GHOST] + 0.25 * delta[:, half_grid:-NUM_GHOST]
         )
 
     def coarsen(self):
@@ -81,10 +76,10 @@ class Block:
             return
 
         # Simplest restriction -- ignore ghosts. Rebuild grid and local average
-        self.U[:, NUM_GHOST:-NUM_GHOST] = 0.5 * np.concat(
+        self.Q[:, NUM_GHOST:-NUM_GHOST] = 0.5 * np.concat(
             [
-                self.left.U[:, NUM_GHOST:-NUM_GHOST],
-                self.right.U[:, NUM_GHOST:-NUM_GHOST],
+                self.left.Q[:, NUM_GHOST:-NUM_GHOST],
+                self.right.Q[:, NUM_GHOST:-NUM_GHOST],
             ],
             axis=1,
         ).reshape(NUM_EQ, -1, 2).sum(axis=2)
@@ -98,19 +93,22 @@ class Block:
         return self.left.get_leaves() + self.right.get_leaves()
 
     def lohner_indicator(self, eps=1e-12):
-        rho = self.U[0]
+        rho = self.Q[0]
 
         d2 = np.abs(rho[:-2] - 2*rho[1:-1] + rho[2:])
         d1 = np.abs(rho[2:] - rho[1:-1]) + np.abs(rho[1:-1] - rho[:-2])
         return np.max(d2 / (d1 + eps))
 
-    def get_dt(self, max_cfl: float = 0.6, gamma: float=DEFAULT_GAMMA):
-        w = cons_to_prim(self.U)
+    def get_dt_ch(self, max_cfl: float = 0.6, gamma: float=DEFAULT_GAMMA):
+        """
+        Computes the min dt and max propagation speed for the block
+        """
+        w = cons_to_prim(self.Q)
         cs = sound_speed(w, gamma=gamma)
         fast_speed = np.abs(w[1]) + cs
 
         dt_local = max_cfl * self.dx / fast_speed
-        return np.min(dt_local)
+        return np.min(dt_local), np.max(fast_speed)
 
 class Forest:
     def __init__(self, x0, x1, N=4, M=64, L=2):
@@ -137,6 +135,7 @@ class Forest:
                 parent=None
             )
             self.roots.append(block)
+        self.fixed_bcs = np.zeros((2, NUM_EQ))
 
     def get_leaves(self) -> List[Block]:
         result = []
@@ -237,23 +236,27 @@ class Forest:
         for i in range(self.L + 1):
             print(f"Set ICS for level {i}")
             for leaf in self.get_leaves():
-                leaf.U[:] = ics(leaf.x_pos, gamma=gamma)
+                leaf.Q[:] = ics(leaf.x_pos, gamma=gamma)
 
             self.regrid(refine_threshold=ERR_THRESH, deref_ratio=DEREF_RATIO)
 
+    def set_fixed_bcs(self, bcs):
+        self.fixed_bcs[0] = bcs[0]
+        self.fixed_bcs[1] = bcs[1]
+
     def flatten(self):
         x_grids = []
-        U_grids = []
+        Q_grids = []
         for leaf in self.get_leaves():
             x_grids.append(leaf.x_pos[NUM_GHOST:-NUM_GHOST])
-            U_grids.append(leaf.U[:, NUM_GHOST:-NUM_GHOST])
+            Q_grids.append(leaf.Q[:, NUM_GHOST:-NUM_GHOST])
         x_grids = np.concatenate(x_grids)
-        U_grids = np.concatenate(U_grids, axis=1)
-        return x_grids, U_grids
+        Q_grids = np.concatenate(Q_grids, axis=1)
+        return x_grids, Q_grids
 
-    def get_dt(self, max_cfl: float=0.6, gamma: float=DEFAULT_GAMMA):
-        dts = [b.get_dt(max_cfl=max_cfl, gamma=gamma) for b in self.get_leaves()]
-        return min(dts)
+    def get_dt_ch(self, max_cfl: float=0.6, gamma: float=DEFAULT_GAMMA):
+        dts, chs = zip(*[b.get_dt_ch(max_cfl=max_cfl, gamma=gamma) for b in self.get_leaves()])
+        return min(dts), max(chs)
 
 
 def enforce_flux_consistency(leaves, fluxes):
@@ -289,7 +292,7 @@ def fill_ghosts(leaves: List[Block]):
             block = leaves[i]
             prev_block = leaves[i-1]
             if block.depth == prev_block.depth:
-                block.U[:, :NUM_GHOST] = prev_block.U[:, -2*NUM_GHOST:-NUM_GHOST]
+                block.Q[:, :NUM_GHOST] = prev_block.Q[:, -2*NUM_GHOST:-NUM_GHOST]
             elif block.depth > prev_block.depth:
                 # refine
 
@@ -297,13 +300,13 @@ def fill_ghosts(leaves: List[Block]):
                 half_ghost = (NUM_GHOST + 1) // 2
 
                 # NOTE(cmo): Minimise reconstruction size
-                parent = block.U[:, NUM_GHOST-1:NUM_GHOST + half_ghost + 1]
+                parent = block.Q[:, NUM_GHOST-1:NUM_GHOST + half_ghost + 1]
                 duL = parent[:, 1:-1] - parent[:, :-2]
                 duR = parent[:, 2:] - parent[:, 1:-1]
                 delta = np.zeros_like(parent)
                 delta[:, 1:-1] = slope_limiter(duL, duR)
-                block.U[:, 0:NUM_GHOST:2] = parent[:, 1:-1] - 0.25 * delta[:, 1:-1]
-                block.U[:, 1:NUM_GHOST:2] = parent[:, 1:-1] + 0.25 * delta[:, 1:-1]
+                block.Q[:, 0:NUM_GHOST:2] = parent[:, 1:-1] - 0.25 * delta[:, 1:-1]
+                block.Q[:, 1:NUM_GHOST:2] = parent[:, 1:-1] + 0.25 * delta[:, 1:-1]
 
                 # Old np.interp approach
                 # prev_grid = prev_block.x_pos
@@ -312,13 +315,13 @@ def fill_ghosts(leaves: List[Block]):
                 #     block.U[v, :NUM_GHOST] = np.interp(this_grid[:NUM_GHOST], prev_grid, prev_block.U[v, :])
             else:
                 # coarsen
-                block.U[:, :NUM_GHOST] = 0.5 * prev_block.U[:, -3 * NUM_GHOST:-NUM_GHOST].reshape(NUM_EQ, NUM_GHOST, 2).sum(axis=2)
+                block.Q[:, :NUM_GHOST] = 0.5 * prev_block.Q[:, -3 * NUM_GHOST:-NUM_GHOST].reshape(NUM_EQ, NUM_GHOST, 2).sum(axis=2)
         if i != len(leaves) - 1:
             # do right ghosts
             block = leaves[i]
             next_block = leaves[i+1]
             if block.depth == next_block.depth:
-                block.U[:, -NUM_GHOST:] = next_block.U[:, NUM_GHOST:2*NUM_GHOST]
+                block.Q[:, -NUM_GHOST:] = next_block.Q[:, NUM_GHOST:2*NUM_GHOST]
             elif block.depth > next_block.depth:
                 # refine
 
@@ -326,13 +329,13 @@ def fill_ghosts(leaves: List[Block]):
                 half_ghost = (NUM_GHOST + 1) // 2
 
                 # NOTE(cmo): Minimise reconstruction size
-                parent = block.U[:, -(NUM_GHOST + half_ghost + 1):-(NUM_GHOST-1)]
+                parent = block.Q[:, -(NUM_GHOST + half_ghost + 1):-(NUM_GHOST-1)]
                 duL = parent[:, 1:-1] - parent[:, :-2]
                 duR = parent[:, 2:] - parent[:, 1:-1]
                 delta = np.zeros_like(parent)
                 delta[:, 1:-1] = slope_limiter(duL, duR)
-                block.U[:, -NUM_GHOST::2] = parent[:, 1:-1] - 0.25 * delta[:, 1:-1]
-                block.U[:, -(NUM_GHOST-1)::2] = parent[:, 1:-1] + 0.25 * delta[:, 1:-1]
+                block.Q[:, -NUM_GHOST::2] = parent[:, 1:-1] - 0.25 * delta[:, 1:-1]
+                block.Q[:, -(NUM_GHOST-1)::2] = parent[:, 1:-1] + 0.25 * delta[:, 1:-1]
 
                 # Old np.interp approach
                 # next_grid = next_block.x_pos
@@ -341,22 +344,26 @@ def fill_ghosts(leaves: List[Block]):
                 #     block.U[v, -NUM_GHOST:] = np.interp(parent[-NUM_GHOST:], next_grid, next_block.U[v, :])
             else:
                 # coarsen
-                block.U[:, -NUM_GHOST:] = 0.5 * next_block.U[:, NUM_GHOST:3*NUM_GHOST].reshape(NUM_EQ, NUM_GHOST, 2).sum(axis=2)
+                block.Q[:, -NUM_GHOST:] = 0.5 * next_block.Q[:, NUM_GHOST:3*NUM_GHOST].reshape(NUM_EQ, NUM_GHOST, 2).sum(axis=2)
 
-def set_bcs(leaves: List[Block], dt, bc_modes):
+def set_bcs(leaves: List[Block], dt, bc_modes, fixed_bc):
     left = leaves[0]
     if bc_modes[0] == SYMMETRIC_BC:
-        left.U[:, :NUM_GHOST] = left.U[:, NUM_GHOST:2*NUM_GHOST][:, ::-1]
+        left.Q[:, :NUM_GHOST] = left.Q[:, NUM_GHOST:2*NUM_GHOST][:, ::-1]
     elif bc_modes[0] == REFLECTING_BC:
-        left.U[:, :NUM_GHOST] = left.U[:, NUM_GHOST:2*NUM_GHOST][:, ::-1]
-        left.U[1, :NUM_GHOST] = -left.U[1, NUM_GHOST:2*NUM_GHOST][::-1]
+        left.Q[:, :NUM_GHOST] = left.Q[:, NUM_GHOST:2*NUM_GHOST][:, ::-1]
+        left.Q[1, :NUM_GHOST] = -left.Q[1, NUM_GHOST:2*NUM_GHOST][::-1]
+    elif bc_modes[0] == FIXED_BC:
+        left.Q[:, :NUM_GHOST] = fixed_bc[0][:, None]
 
     right = leaves[-1]
     if bc_modes[1] == SYMMETRIC_BC:
-        right.U[:, -NUM_GHOST:] = right.U[:, -2*NUM_GHOST:-NUM_GHOST][:, ::-1]
+        right.Q[:, -NUM_GHOST:] = right.Q[:, -2*NUM_GHOST:-NUM_GHOST][:, ::-1]
     elif bc_modes[1] == REFLECTING_BC:
-        right.U[:, -NUM_GHOST:] = right.U[:, -2*NUM_GHOST:-NUM_GHOST][:, ::-1]
-        right.U[1, -NUM_GHOST:] = -right.U[1, -2*NUM_GHOST:-NUM_GHOST][::-1]
+        right.Q[:, -NUM_GHOST:] = right.Q[:, -2*NUM_GHOST:-NUM_GHOST][:, ::-1]
+        right.Q[1, -NUM_GHOST:] = -right.Q[1, -2*NUM_GHOST:-NUM_GHOST][::-1]
+    elif bc_modes[1] == FIXED_BC:
+        right.Q[:, -NUM_GHOST:] = fixed_bc[1][:, None]
 
 def rusanov_flux_with_padding(wL, wR, gamma: float=DEFAULT_GAMMA):
     # N.B. This takes the reconstructed faces in the cell frame, and returns a padded array with length (M+2*NUM_GHOST+1), i.e the flux at each interface in the block
@@ -374,65 +381,112 @@ def rusanov_flux_with_padding(wL, wR, gamma: float=DEFAULT_GAMMA):
     full_flux[:, -NUM_GHOST:] = 0.0
     return full_flux
 
-def run_step(leaves, dt, bc_modes, gamma: float=DEFAULT_GAMMA):
-    scalar_grid = False
-    U_old = [l.U.copy() for l in leaves]
-    if not scalar_grid:
-        U_old_stack = np.stack(U_old, axis=-1)
+@dataclass
+class TimestepInfo:
+    dt: float
+    """timestep"""
+    cfl: float
+    """associated cfl"""
+    c_h: float
+    """max hyperbolic wave speed"""
 
+def run_step(leaves: List[Block], ts: TimestepInfo, bc_modes, fixed_bcs, gamma: float=DEFAULT_GAMMA):
+    scalar_grid = True
+    Q_old = [l.Q.copy() for l in leaves]
+    if not scalar_grid:
+        Q_old_stack = np.stack(Q_old, axis=-1)
+        sources = np.zeros_like(Q_old_stack)
+    else:
+        sources = [np.zeros_like(q) for q in Q_old]
+
+    dt = ts.dt
+    avg_mass = 1.0
     dt_scheme = [dt, 0.5 * dt]
 
     for substep, dt_sub in enumerate(dt_scheme):
         fluxes = []
         fill_ghosts(leaves)
-        set_bcs(leaves, dt_sub, bc_modes)
+        set_bcs(leaves, dt_sub, bc_modes, fixed_bcs)
         if scalar_grid:
-            for leaf in leaves:
-                w = cons_to_prim(leaf.U, gamma=gamma)
+            for s in sources:
+                s[...] = 0.0
+            for leaf, source in zip(leaves, sources):
+                w = cons_to_prim(leaf.Q, gamma=gamma)
                 # Relative to cells
                 wL, wR = reconstruct_plm(w)
                 # wL, wR = reconstruct_fog(w)
                 interface_flux = rusanov_flux_with_padding(wL, wR, gamma=gamma)
                 fluxes.append(interface_flux)
 
+                if USE_CONDUCTION:
+                    nh_tot = w[RHO] / (avg_mass * P_MASS)
+                    y = 1.0
+                    temperature = temperature_si(w[PRES], nh_tot, y)
+                    compute_heatf_source(
+                        temperature,
+                        leaf.Q,
+                        w,
+                        source,
+                        leaf.dx,
+                        dt_sub,
+                        ts.cfl,
+                        ts.c_h,
+                        gamma=gamma
+                    )
+
             enforce_flux_consistency(leaves, fluxes)
 
-            for idx, block in enumerate(leaves):
+            for idx, (block, source) in enumerate(zip(leaves, sources)):
                 dx = block.dx
                 flux = fluxes[idx]
                 flux_div = flux[:, NUM_GHOST+1:-NUM_GHOST] - flux[:, NUM_GHOST:-(NUM_GHOST+1)]
-                # TODO(cmo): Source terms
-                flux_update = - dt_sub / dx * flux_div
+                flux_update = - dt_sub / dx * flux_div + source[:, NUM_GHOST:-NUM_GHOST] * dt_sub
                 if substep == 0:
-                    block.U[:, NUM_GHOST:-NUM_GHOST] += flux_update
+                    block.Q[:, NUM_GHOST:-NUM_GHOST] += flux_update
                 else:
-                    block.U[:, NUM_GHOST:-NUM_GHOST] = 0.5 * (
-                        U_old[idx][:, NUM_GHOST:-NUM_GHOST] + block.U[:, NUM_GHOST:-NUM_GHOST]
+                    block.Q[:, NUM_GHOST:-NUM_GHOST] = 0.5 * (
+                        Q_old[idx][:, NUM_GHOST:-NUM_GHOST] + block.Q[:, NUM_GHOST:-NUM_GHOST]
                     ) + flux_update
         else:
+            sources[...] = 0.0
             # NOTE(cmo): This isn't a super awesome layout for SIMD etc, but
             # it's the minimum changes for vectorising
-            leaf_stack = np.stack([l.U for l in leaves], axis=-1)
+            leaf_stack = np.stack([l.Q for l in leaves], axis=-1)
             depths = np.array([l.depth for l in leaves], dtype=np.int32)
             dxs = np.array([l.dx for l in leaves])
             w = cons_to_prim(leaf_stack, gamma=gamma)
             wL, wR = reconstruct_plm(w)
             flux_stack = rusanov_flux_with_padding(wL, wR, gamma=gamma)
 
+            if USE_CONDUCTION:
+                nh_tot = w[RHO] / (avg_mass * P_MASS)
+                y = 1.0
+                temperature = temperature_si(w[PRES], nh_tot, y)
+                compute_heatf_source(
+                    temperature,
+                    leaf_stack,
+                    w,
+                    sources,
+                    dxs[None, None, :],
+                    dt_sub,
+                    ts.cfl,
+                    ts.c_h,
+                    gamma=gamma
+                )
+
             enforce_flux_consistency_vector(leaf_stack, depths, flux_stack)
 
             flux_div = flux_stack[:, NUM_GHOST+1:-NUM_GHOST, :] - flux_stack[:, NUM_GHOST:-(NUM_GHOST+1), :]
-            # TODO(cmo): Source terms
-            flux_update = - dt_sub / dxs[None, None, :] * flux_div
+            flux_update = - dt_sub / dxs[None, None, :] * flux_div + sources[:, NUM_GHOST:-NUM_GHOST] * dt_sub
             if substep == 0:
                 leaf_stack[:, NUM_GHOST:-NUM_GHOST, :] += flux_update
             else:
                 leaf_stack[:, NUM_GHOST:-NUM_GHOST, :] = 0.5 * (
-                    U_old_stack[:, NUM_GHOST:-NUM_GHOST, :] + leaf_stack[:, NUM_GHOST:-NUM_GHOST]
+                    Q_old_stack[:, NUM_GHOST:-NUM_GHOST, :] + leaf_stack[:, NUM_GHOST:-NUM_GHOST]
                 ) + flux_update
             # NOTE(cmo): This copy is gonna be sloooooow
             for i, block in enumerate(leaves):
-                block.U[...] = leaf_stack[:, :, i]
+                block.Q[...] = leaf_stack[:, :, i]
 
 
 def sod_ics(x, gamma=DEFAULT_GAMMA):
@@ -446,6 +500,17 @@ def sod_ics(x, gamma=DEFAULT_GAMMA):
 def sod_bcs():
     return [SYMMETRIC_BC, SYMMETRIC_BC]
 
+def big_sod_ics(x, gamma=DEFAULT_GAMMA):
+    w = np.stack([
+        np.where(x < 0.5, 1.0, 0.125),
+        np.zeros_like(x),
+        np.where(x < 0.5, 10.0, 0.1),
+    ])
+    return prim_to_cons(w, gamma=gamma)
+
+def big_sod_bcs():
+    return [SYMMETRIC_BC, SYMMETRIC_BC]
+
 def woodward_collela_ics(x, gamma=DEFAULT_GAMMA):
     w = np.stack([
         np.ones_like(x),
@@ -457,48 +522,107 @@ def woodward_collela_ics(x, gamma=DEFAULT_GAMMA):
 def woodward_collela_bcs():
     return [REFLECTING_BC, REFLECTING_BC]
 
-def run_sim(forest, bc_modes, max_time, max_cfl=0.5, max_steps=10_000_000):
+def rempel_hypertc_test_ics(x, gamma=DEFAULT_GAMMA):
+    temperature = 0.1 + 0.9*x**5
+    rho = np.ones_like(x)
+    v = np.zeros_like(x)
+    avg_mass = 1.0
+    p = 2.0 * rho / (avg_mass * P_MASS) * k_B * temperature
+
+    if not USE_CONDUCTION:
+        raise ValueError("Need conduction")
+
+    w = np.empty((NUM_EQ, x.shape[0]))
+    w[RHO] = rho
+    w[VEL] = v
+    w[PRES] = p
+    w[HEATF] = 0.0
+    return prim_to_cons(w)
+
+def rempel_hypertc_test_bcs():
+    return [FIXED_BC, FIXED_BC]
+
+def rempel_hypertc_test_fixed_bcs(gamma=DEFAULT_GAMMA):
+    temp0 = 0.1
+    p0 = 2.0 / P_MASS * k_B * temp0
+    temp1 = 1.0
+    p1 = 2.0 / P_MASS * k_B * temp1
+    return [
+        np.array([1.0, 0.0, p0 / (gamma - 1.0), 0.0]),
+        np.array([1.0, 0.0, p1 / (gamma - 1.0), 0.0]),
+    ]
+
+def run_sim(forest: Forest, bc_modes, max_time, max_cfl=0.5, max_steps=10_000_000, output_cadence=0.25):
     current_time = 0.0
-    dt = forest.get_dt(max_cfl=max_cfl, gamma=DEFAULT_GAMMA)
+    dt, max_ch = forest.get_dt_ch(max_cfl=max_cfl, gamma=DEFAULT_GAMMA)
     leaves = forest.get_leaves()
+    snaps = []
+    next_output = current_time + output_cadence
+    snaps.append((current_time, *forest.flatten()))
     for i in range(max_steps):
-        run_step(leaves, dt, bc_modes, gamma=DEFAULT_GAMMA)
+        timestep_info = TimestepInfo(dt, max_cfl, max_ch)
+        run_step(leaves, timestep_info, bc_modes, forest.fixed_bcs, gamma=DEFAULT_GAMMA)
 
         current_time += dt
+        if current_time >= next_output:
+            snaps.append((current_time, *forest.flatten()))
+            next_output = current_time + output_cadence
+        if i % 50 == 0 or current_time >= max_time:
+            print(f"t: {current_time:.4f} s, dt: {dt:.2e} s, iter: {i:9d}, grids: {len(leaves):d}")
         if current_time >= max_time:
             break
 
         if i > 0 and i % REGRID_FREQ == 0:
             forest.regrid(refine_threshold=ERR_THRESH, deref_ratio=DEREF_RATIO)
             leaves = forest.get_leaves()
-            set_bcs(leaves, dt, bc_modes)
+            set_bcs(leaves, dt, bc_modes, forest.fixed_bcs)
             fill_ghosts(leaves)
 
-        dt = forest.get_dt(max_cfl=max_cfl, gamma=DEFAULT_GAMMA)
-        if current_time + dt > max_time:
-            dt = max_time - current_time
-            while current_time + dt < max_time:
+        dt, max_ch = forest.get_dt_ch(max_cfl=max_cfl, gamma=DEFAULT_GAMMA)
+        if current_time + dt > next_output:
+            dt = next_output - current_time
+            while current_time + dt < next_output:
                 dt = np.nextafter(dt, np.inf)
-        if i % 50 == 0:
-            print(f"t: {current_time:.4f} s, dt: {dt:.2e} s, iter: {i:9d}, grids: {len(leaves):d}")
+    return snaps
+
+def cons_to_temperature(Q, gamma=DEFAULT_GAMMA):
+    w = cons_to_prim(Q, gamma=gamma)
+    nh_tot = w[RHO] / (P_MASS)
+    return temperature_si(w[PRES], nh_tot, 1.0)
 
 if __name__ == '__main__':
-    ics = sod_ics
-    bcs = sod_bcs
-    max_time = 0.2
+    fixed_bcs = None
+
+    # ics = sod_ics
+    # bcs = sod_bcs
+    # max_time = 0.2
+
+    # ics = big_sod_ics
+    # bcs = big_sod_bcs
+    # max_time = 0.1
 
     # ics = woodward_collela_ics
     # bcs = woodward_collela_bcs
     # max_time = 0.038
 
-    forest = Forest(0.0, 1.0, N=8, M=16, L=3)
+    # k_B = 1.0
+    # P_MASS = 1.0
+    ics = rempel_hypertc_test_ics
+    bcs = rempel_hypertc_test_bcs
+    fixed_bcs = rempel_hypertc_test_fixed_bcs()
+    max_time = 1.0
+
+    forest = Forest(0.0, 1.0, N=1, M=100, L=0)
     forest.set_ics(ics)
-    forest_uni = Forest(0.0, 1.0, N=1, M=1024, L=0)
-    forest_uni.set_ics(ics)
+    if fixed_bcs is not None:
+        forest.set_fixed_bcs(fixed_bcs)
+    # forest_uni = Forest(0.0, 1.0, N=1, M=2048, L=0)
+    # forest_uni.set_ics(ics)
     bc_modes = bcs()
 
-    run_sim(forest, bc_modes, max_time=max_time)
-    run_sim(forest_uni, bc_modes, max_time=max_time)
+    x0, Q0 = forest.flatten()
+    states = run_sim(forest, bc_modes, max_time=max_time)
+    # run_sim(forest_uni, bc_modes, max_time=max_time)
 
-    flat_x, flat_U = forest.flatten()
-    flat_x_u, flat_U_u = forest_uni.flatten()
+    flat_x, flat_Q = forest.flatten()
+    # flat_x_u, flat_Q_u = forest_uni.flatten()
