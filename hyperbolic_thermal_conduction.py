@@ -1,6 +1,6 @@
 import numpy as np
 from config import (
-    HYPERTC_KAPPA,
+    KAPPA0,
     SPITZER_CONDUCTIVITY,
     HYPERTC_IN_FLUX_VECTOR,
     SATURATE_HEAT_FLUX,
@@ -21,7 +21,7 @@ def compute_heatf_source(temperature, Q, W, S, dx, dt, cfl, max_ch, gamma=DEFAUL
     w1 = 8.0 / 12.0
     w2 = 1.0 / 12.0
 
-    sigma_T_52 = HYPERTC_KAPPA
+    sigma_T_52 = KAPPA0
     if SPITZER_CONDUCTIVITY:
         sigma_T_52 *= temperature**2.5
 

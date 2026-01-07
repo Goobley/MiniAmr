@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from hyperbolic_thermal_conduction import compute_heatf_source
+from implicit_thermal_conduction import implicit_thermal_conduction
 try:
     get_ipython().run_line_magic("matplotlib", "")
 except:
@@ -37,7 +38,15 @@ class Block:
 
     @property
     def x_pos(self):
-        return (self.x0 - NUM_GHOST * self.dx) + np.arange(self.Q.shape[1]) * self.dx
+        return (self.x0 - NUM_GHOST * self.dx) + (np.arange(self.Q.shape[1]) + 0.5) * self.dx
+
+    @property
+    def interface_pos(self):
+        return np.linspace(
+            self.x0 - NUM_GHOST * self.dx,
+            self.x1 + NUM_GHOST * self.dx,
+            self.M + 1 + 2 * NUM_GHOST
+        )
 
     def refine(self):
         if self.depth == self.max_depth:
@@ -252,9 +261,10 @@ class Forest:
         if right_bc is not None:
             self.right_bc_fn = right_bc
 
-    def flatten(self):
+    def flatten(self, return_interfaces=False):
         x_grids = []
         Q_grids = []
+        interface_grids = []
         leaves = self.get_leaves()
         for i, leaf in enumerate(leaves):
             slice_start = NUM_GHOST
@@ -265,9 +275,13 @@ class Forest:
                 slice_end = None
 
             x_grids.append(leaf.x_pos[slice_start:slice_end])
+            interface_grids.append(leaf.interface_pos[slice_start:slice_end])
             Q_grids.append(leaf.Q[:, slice_start:slice_end])
         x_grids = np.concatenate(x_grids)
+        interface_grids = np.concatenate(interface_grids)
         Q_grids = np.concatenate(Q_grids, axis=1)
+        if return_interfaces:
+            return x_grids, interface_grids, Q_grids
         return x_grids, Q_grids
 
     def get_dt_ch(self, max_cfl: float=0.6, gamma: float=DEFAULT_GAMMA):
@@ -438,7 +452,7 @@ def run_step(leaves: List[Block], ts: TimestepInfo, bc_modes, fixed_bcs, gamma: 
                 interface_flux = rusanov_flux_with_padding(wL, wR, gamma=gamma)
                 fluxes.append(interface_flux)
 
-                if USE_CONDUCTION:
+                if USE_CONDUCTION and COND_MODE == COND_HTC:
                     nh_tot = w[RHO] / (avg_mass * P_MASS)
                     y = 0.0
                     temperature = temperature_si(w[PRES], nh_tot, y)
@@ -478,7 +492,7 @@ def run_step(leaves: List[Block], ts: TimestepInfo, bc_modes, fixed_bcs, gamma: 
             wL, wR = reconstruct_plm(w)
             flux_stack = rusanov_flux_with_padding(wL, wR, gamma=gamma)
 
-            if USE_CONDUCTION:
+            if USE_CONDUCTION and COND_MODE == COND_HTC:
                 nh_tot = w[RHO] / (avg_mass * P_MASS)
                 y = 0.0
                 temperature = temperature_si(w[PRES], nh_tot, y)
@@ -551,12 +565,15 @@ def navarro_hypertc_test_ics(x, gamma=DEFAULT_GAMMA):
 
     if not USE_CONDUCTION:
         raise ValueError("Need conduction")
+    if NUM_GHOST < 2:
+        raise ValueError("Need 2 ghost cells for conduction")
 
     w = np.empty((NUM_EQ, x.shape[0]))
     w[RHO] = rho
     w[VEL] = v
     w[PRES] = p
-    w[HEATF] = 0.0
+    if COND_MODE == COND_HTC:
+        w[HEATF] = 0.0
     return prim_to_cons(w, gamma=gamma)
 
 def navarro_hypertc_test_bcs():
@@ -567,16 +584,18 @@ def navarro_hypertc_test_left_bc(block, dt, gamma=DEFAULT_GAMMA):
     block.Q[MOM, :NUM_GHOST] = 0.0
     p = 1.0 / P_MASS * k_B * 0.1
     block.Q[ENE, :NUM_GHOST] = p / (gamma - 1.0)
-    # block.Q[HEATF, :NUM_GHOST] = block.Q[HEATF, NUM_GHOST:2*NUM_GHOST][::-1]
-    block.Q[HEATF, :NUM_GHOST] = block.Q[HEATF, NUM_GHOST]
+    if COND_MODE == COND_HTC:
+        # block.Q[HEATF, :NUM_GHOST] = block.Q[HEATF, NUM_GHOST:2*NUM_GHOST][::-1]
+        block.Q[HEATF, :NUM_GHOST] = block.Q[HEATF, NUM_GHOST]
 
 def navarro_hypertc_test_right_bc(block, dt, gamma=DEFAULT_GAMMA):
     block.Q[RHO, -NUM_GHOST:] = 1.0
     block.Q[MOM, -NUM_GHOST:] = 0.0
     p = 1.0 / P_MASS * k_B * 1.0
     block.Q[ENE, -NUM_GHOST:] = p / (gamma - 1.0)
-    # block.Q[HEATF, -NUM_GHOST:] = block.Q[HEATF, -2*NUM_GHOST:-NUM_GHOST][::-1]
-    block.Q[HEATF, -NUM_GHOST:] = block.Q[HEATF, -NUM_GHOST-1]
+    if COND_MODE == COND_HTC:
+        # block.Q[HEATF, -NUM_GHOST:] = block.Q[HEATF, -2*NUM_GHOST:-NUM_GHOST][::-1]
+        block.Q[HEATF, -NUM_GHOST:] = block.Q[HEATF, -NUM_GHOST-1]
 
 def run_sim(forest: Forest, bc_modes, max_time, max_cfl=0.5, max_steps=10_000_000, output_cadence=0.25):
     current_time = 0.0
@@ -588,6 +607,10 @@ def run_sim(forest: Forest, bc_modes, max_time, max_cfl=0.5, max_steps=10_000_00
     for i in range(max_steps):
         timestep_info = TimestepInfo(dt, max_cfl, max_ch)
         run_step(leaves, timestep_info, bc_modes, forest.fixed_bcs, gamma=DEFAULT_GAMMA)
+        if USE_CONDUCTION and COND_MODE == COND_IMPLICIT:
+            implicit_thermal_conduction(forest, dt, gamma=DEFAULT_GAMMA)
+            set_bcs(leaves, dt, bc_modes, forest.fixed_bcs, forest.left_bc_fn, forest.right_bc_fn, gamma=DEFAULT_GAMMA)
+            fill_ghosts(leaves)
 
         current_time += dt
         if current_time >= next_output:
@@ -640,7 +663,7 @@ if __name__ == '__main__':
     ics = navarro_hypertc_test_ics
     bcs = navarro_hypertc_test_bcs
     user_bcs = (navarro_hypertc_test_left_bc, navarro_hypertc_test_right_bc)
-    max_time = 1.0
+    max_time = 2.0
 
     forest = Forest(0.0, 1.0, N=1, M=250, L=0)
     forest.set_ics(ics)

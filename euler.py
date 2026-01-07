@@ -1,6 +1,6 @@
 import numpy as np
 Array = np.ndarray
-from config import DEFAULT_GAMMA, RHO, MOM, ENE, VEL, PRES, HEATF, HYPERTC_IN_FLUX_VECTOR, USE_CONDUCTION, CONDUCTION_ONLY, k_B
+from config import COND_HTC, COND_MODE, DEFAULT_GAMMA, RHO, MOM, ENE, VEL, PRES, HEATF, HYPERTC_IN_FLUX_VECTOR, USE_CONDUCTION, CONDUCTION_ONLY, k_B
 
 def cons_to_prim(Q: Array, gamma: float=DEFAULT_GAMMA) -> Array:
     W = np.empty_like(Q)
@@ -17,7 +17,7 @@ def cons_to_prim(Q: Array, gamma: float=DEFAULT_GAMMA) -> Array:
     W[RHO] = rho
     W[VEL] = v
     W[PRES] = p
-    if USE_CONDUCTION:
+    if USE_CONDUCTION and COND_MODE == COND_HTC:
         W[HEATF] = Q[HEATF]
 
     return W
@@ -35,7 +35,7 @@ def prim_to_cons(W: Array, gamma: float=DEFAULT_GAMMA) -> Array:
     Q[RHO] = rho
     Q[MOM] = mom
     Q[ENE] = energy
-    if USE_CONDUCTION:
+    if USE_CONDUCTION and COND_MODE == COND_HTC:
         Q[HEATF] = W[HEATF]
 
     return Q
@@ -53,16 +53,16 @@ def prim_to_flux(W: Array, gamma: float=DEFAULT_GAMMA) -> Array:
     e_tot = p / (gamma - 1.0) + e_kin
     ene_flux = (e_tot + p) * v
 
-    if USE_CONDUCTION:
+    if USE_CONDUCTION and COND_MODE == COND_HTC:
         flux[HEATF] = 0.0
         if HYPERTC_IN_FLUX_VECTOR:
             ene_flux += W[HEATF]
-        if CONDUCTION_ONLY:
-            mass_flux = 0.0
-            mom_flux = 0.0
-            ene_flux = 0.0
-            if HYPERTC_IN_FLUX_VECTOR:
-                ene_flux = W[HEATF]
+    if USE_CONDUCTION and CONDUCTION_ONLY:
+        mass_flux = 0.0
+        mom_flux = 0.0
+        ene_flux = 0.0
+        if HYPERTC_IN_FLUX_VECTOR:
+            ene_flux = W[HEATF]
 
     flux[RHO] = mass_flux
     flux[MOM] = mom_flux
