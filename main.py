@@ -136,6 +136,8 @@ class Forest:
             )
             self.roots.append(block)
         self.fixed_bcs = np.zeros((2, NUM_EQ))
+        self.left_bc_fn = lambda block, dt: None
+        self.right_bc_fn = lambda block, dt: None
 
     def get_leaves(self) -> List[Block]:
         result = []
@@ -244,12 +246,26 @@ class Forest:
         self.fixed_bcs[0] = bcs[0]
         self.fixed_bcs[1] = bcs[1]
 
+    def set_user_bc_fns(self, left_bc=None, right_bc=None):
+        if left_bc is not None:
+            self.left_bc_fn = left_bc
+        if right_bc is not None:
+            self.right_bc_fn = right_bc
+
     def flatten(self):
         x_grids = []
         Q_grids = []
-        for leaf in self.get_leaves():
-            x_grids.append(leaf.x_pos[NUM_GHOST:-NUM_GHOST])
-            Q_grids.append(leaf.Q[:, NUM_GHOST:-NUM_GHOST])
+        leaves = self.get_leaves()
+        for i, leaf in enumerate(leaves):
+            slice_start = NUM_GHOST
+            slice_end = -NUM_GHOST
+            if i == 0:
+                slice_start = None
+            if i == len(leaves) - 1:
+                slice_end = None
+
+            x_grids.append(leaf.x_pos[slice_start:slice_end])
+            Q_grids.append(leaf.Q[:, slice_start:slice_end])
         x_grids = np.concatenate(x_grids)
         Q_grids = np.concatenate(Q_grids, axis=1)
         return x_grids, Q_grids
@@ -346,7 +362,7 @@ def fill_ghosts(leaves: List[Block]):
                 # coarsen
                 block.Q[:, -NUM_GHOST:] = 0.5 * next_block.Q[:, NUM_GHOST:3*NUM_GHOST].reshape(NUM_EQ, NUM_GHOST, 2).sum(axis=2)
 
-def set_bcs(leaves: List[Block], dt, bc_modes, fixed_bc):
+def set_bcs(leaves: List[Block], dt, bc_modes, fixed_bc, left_bc_fn, right_bc_fn, gamma=DEFAULT_GAMMA):
     left = leaves[0]
     if bc_modes[0] == SYMMETRIC_BC:
         left.Q[:, :NUM_GHOST] = left.Q[:, NUM_GHOST:2*NUM_GHOST][:, ::-1]
@@ -355,6 +371,8 @@ def set_bcs(leaves: List[Block], dt, bc_modes, fixed_bc):
         left.Q[1, :NUM_GHOST] = -left.Q[1, NUM_GHOST:2*NUM_GHOST][::-1]
     elif bc_modes[0] == FIXED_BC:
         left.Q[:, :NUM_GHOST] = fixed_bc[0][:, None]
+    elif bc_modes[0] == USER_BC:
+        left_bc_fn(left, dt, gamma=gamma)
 
     right = leaves[-1]
     if bc_modes[1] == SYMMETRIC_BC:
@@ -364,6 +382,8 @@ def set_bcs(leaves: List[Block], dt, bc_modes, fixed_bc):
         right.Q[1, -NUM_GHOST:] = -right.Q[1, -2*NUM_GHOST:-NUM_GHOST][::-1]
     elif bc_modes[1] == FIXED_BC:
         right.Q[:, -NUM_GHOST:] = fixed_bc[1][:, None]
+    elif bc_modes[1] == USER_BC:
+        right_bc_fn(right, dt, gamma=gamma)
 
 def rusanov_flux_with_padding(wL, wR, gamma: float=DEFAULT_GAMMA):
     # N.B. This takes the reconstructed faces in the cell frame, and returns a padded array with length (M+2*NUM_GHOST+1), i.e the flux at each interface in the block
@@ -406,7 +426,7 @@ def run_step(leaves: List[Block], ts: TimestepInfo, bc_modes, fixed_bcs, gamma: 
     for substep, dt_sub in enumerate(dt_scheme):
         fluxes = []
         fill_ghosts(leaves)
-        set_bcs(leaves, dt_sub, bc_modes, fixed_bcs)
+        set_bcs(leaves, dt_sub, bc_modes, fixed_bcs, forest.left_bc_fn, forest.right_bc_fn, gamma=gamma)
         if scalar_grid:
             for s in sources:
                 s[...] = 0.0
@@ -420,7 +440,7 @@ def run_step(leaves: List[Block], ts: TimestepInfo, bc_modes, fixed_bcs, gamma: 
 
                 if USE_CONDUCTION:
                     nh_tot = w[RHO] / (avg_mass * P_MASS)
-                    y = 1.0
+                    y = 0.0
                     temperature = temperature_si(w[PRES], nh_tot, y)
                     compute_heatf_source(
                         temperature,
@@ -428,7 +448,7 @@ def run_step(leaves: List[Block], ts: TimestepInfo, bc_modes, fixed_bcs, gamma: 
                         w,
                         source,
                         leaf.dx,
-                        dt_sub,
+                        ts.dt,
                         ts.cfl,
                         ts.c_h,
                         gamma=gamma
@@ -460,7 +480,7 @@ def run_step(leaves: List[Block], ts: TimestepInfo, bc_modes, fixed_bcs, gamma: 
 
             if USE_CONDUCTION:
                 nh_tot = w[RHO] / (avg_mass * P_MASS)
-                y = 1.0
+                y = 0.0
                 temperature = temperature_si(w[PRES], nh_tot, y)
                 compute_heatf_source(
                     temperature,
@@ -468,7 +488,7 @@ def run_step(leaves: List[Block], ts: TimestepInfo, bc_modes, fixed_bcs, gamma: 
                     w,
                     sources,
                     dxs[None, None, :],
-                    dt_sub,
+                    ts.dt,
                     ts.cfl,
                     ts.c_h,
                     gamma=gamma
@@ -522,12 +542,12 @@ def woodward_collela_ics(x, gamma=DEFAULT_GAMMA):
 def woodward_collela_bcs():
     return [REFLECTING_BC, REFLECTING_BC]
 
-def rempel_hypertc_test_ics(x, gamma=DEFAULT_GAMMA):
+def navarro_hypertc_test_ics(x, gamma=DEFAULT_GAMMA):
     temperature = 0.1 + 0.9*x**5
     rho = np.ones_like(x)
     v = np.zeros_like(x)
     avg_mass = 1.0
-    p = 2.0 * rho / (avg_mass * P_MASS) * k_B * temperature
+    p = 1.0 * rho / (avg_mass * P_MASS) * k_B * temperature
 
     if not USE_CONDUCTION:
         raise ValueError("Need conduction")
@@ -537,20 +557,26 @@ def rempel_hypertc_test_ics(x, gamma=DEFAULT_GAMMA):
     w[VEL] = v
     w[PRES] = p
     w[HEATF] = 0.0
-    return prim_to_cons(w)
+    return prim_to_cons(w, gamma=gamma)
 
-def rempel_hypertc_test_bcs():
-    return [FIXED_BC, FIXED_BC]
+def navarro_hypertc_test_bcs():
+    return [USER_BC, USER_BC]
 
-def rempel_hypertc_test_fixed_bcs(gamma=DEFAULT_GAMMA):
-    temp0 = 0.1
-    p0 = 2.0 / P_MASS * k_B * temp0
-    temp1 = 1.0
-    p1 = 2.0 / P_MASS * k_B * temp1
-    return [
-        np.array([1.0, 0.0, p0 / (gamma - 1.0), 0.0]),
-        np.array([1.0, 0.0, p1 / (gamma - 1.0), 0.0]),
-    ]
+def navarro_hypertc_test_left_bc(block, dt, gamma=DEFAULT_GAMMA):
+    block.Q[RHO, :NUM_GHOST] = 1.0
+    block.Q[MOM, :NUM_GHOST] = 0.0
+    p = 1.0 / P_MASS * k_B * 0.1
+    block.Q[ENE, :NUM_GHOST] = p / (gamma - 1.0)
+    # block.Q[HEATF, :NUM_GHOST] = block.Q[HEATF, NUM_GHOST:2*NUM_GHOST][::-1]
+    block.Q[HEATF, :NUM_GHOST] = block.Q[HEATF, NUM_GHOST]
+
+def navarro_hypertc_test_right_bc(block, dt, gamma=DEFAULT_GAMMA):
+    block.Q[RHO, -NUM_GHOST:] = 1.0
+    block.Q[MOM, -NUM_GHOST:] = 0.0
+    p = 1.0 / P_MASS * k_B * 1.0
+    block.Q[ENE, -NUM_GHOST:] = p / (gamma - 1.0)
+    # block.Q[HEATF, -NUM_GHOST:] = block.Q[HEATF, -2*NUM_GHOST:-NUM_GHOST][::-1]
+    block.Q[HEATF, -NUM_GHOST:] = block.Q[HEATF, -NUM_GHOST-1]
 
 def run_sim(forest: Forest, bc_modes, max_time, max_cfl=0.5, max_steps=10_000_000, output_cadence=0.25):
     current_time = 0.0
@@ -575,10 +601,12 @@ def run_sim(forest: Forest, bc_modes, max_time, max_cfl=0.5, max_steps=10_000_00
         if i > 0 and i % REGRID_FREQ == 0:
             forest.regrid(refine_threshold=ERR_THRESH, deref_ratio=DEREF_RATIO)
             leaves = forest.get_leaves()
-            set_bcs(leaves, dt, bc_modes, forest.fixed_bcs)
+            set_bcs(leaves, dt, bc_modes, forest.fixed_bcs, forest.left_bc_fn, forest.right_bc_fn, gamma=DEFAULT_GAMMA)
             fill_ghosts(leaves)
 
         dt, max_ch = forest.get_dt_ch(max_cfl=max_cfl, gamma=DEFAULT_GAMMA)
+        # dt = 1e-4
+        # max_ch = min([leaf.dx for leaf in forest.get_leaves()]) / dt / max_cfl
         if current_time + dt > next_output:
             dt = next_output - current_time
             while current_time + dt < next_output:
@@ -588,10 +616,11 @@ def run_sim(forest: Forest, bc_modes, max_time, max_cfl=0.5, max_steps=10_000_00
 def cons_to_temperature(Q, gamma=DEFAULT_GAMMA):
     w = cons_to_prim(Q, gamma=gamma)
     nh_tot = w[RHO] / (P_MASS)
-    return temperature_si(w[PRES], nh_tot, 1.0)
+    return temperature_si(w[PRES], nh_tot, 0.0)
 
 if __name__ == '__main__':
     fixed_bcs = None
+    user_bcs = None
 
     # ics = sod_ics
     # bcs = sod_bcs
@@ -607,15 +636,18 @@ if __name__ == '__main__':
 
     # k_B = 1.0
     # P_MASS = 1.0
-    ics = rempel_hypertc_test_ics
-    bcs = rempel_hypertc_test_bcs
-    fixed_bcs = rempel_hypertc_test_fixed_bcs()
+    P_MASS = k_B
+    ics = navarro_hypertc_test_ics
+    bcs = navarro_hypertc_test_bcs
+    user_bcs = (navarro_hypertc_test_left_bc, navarro_hypertc_test_right_bc)
     max_time = 1.0
 
-    forest = Forest(0.0, 1.0, N=1, M=100, L=0)
+    forest = Forest(0.0, 1.0, N=1, M=250, L=0)
     forest.set_ics(ics)
     if fixed_bcs is not None:
         forest.set_fixed_bcs(fixed_bcs)
+    if user_bcs is not None:
+        forest.set_user_bc_fns(left_bc=user_bcs[0], right_bc=user_bcs[1])
     # forest_uni = Forest(0.0, 1.0, N=1, M=2048, L=0)
     # forest_uni.set_ics(ics)
     bc_modes = bcs()
