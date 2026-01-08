@@ -1,5 +1,6 @@
 import numpy as np
 from config import (
+    HTC_HYPERDIFFUSION,
     KAPPA0,
     SPITZER_CONDUCTIVITY,
     HYPERTC_IN_FLUX_VECTOR,
@@ -40,6 +41,13 @@ def compute_heatf_source(temperature, Q, W, S, dx, dt, cfl, max_ch, gamma=DEFAUL
         f_sat * sigma_T_72 * cfl**2 * (gamma - 1.0) / (W[PRES] * max_ch**2)
     )
     heatf_source = (f_sat * sigma_T_52 * B_gradT + W[HEATF]) / tau
+    if HTC_HYPERDIFFUSION > 0.0:
+        hyp = HTC_HYPERDIFFUSION / dt
+        S[HEATF, NUM_GHOST:-NUM_GHOST] -= hyp * (
+            (W[HEATF, NUM_GHOST+2:(-NUM_GHOST+2 if NUM_GHOST > 2 else None)] + W[HEATF, NUM_GHOST-2:-NUM_GHOST-2])
+            -4.0 * (W[HEATF, NUM_GHOST+1:-NUM_GHOST+1] + W[HEATF, NUM_GHOST-1:-NUM_GHOST-1])
+            + 6.0 * W[HEATF, NUM_GHOST:-NUM_GHOST]
+        )
     S[HEATF, NUM_GHOST:-NUM_GHOST] -= heatf_source[NUM_GHOST:-NUM_GHOST]
 
     if not HYPERTC_IN_FLUX_VECTOR:

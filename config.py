@@ -34,10 +34,11 @@ HEATF = 3 if USE_CONDUCTION else 1024
 # Conduction
 COND_HTC = 0
 COND_IMPLICIT = 1
-COND_MODE = COND_IMPLICIT
-HYPERTC_IN_FLUX_VECTOR = False
-SATURATE_HEAT_FLUX = True
+COND_MODE = COND_HTC
+HYPERTC_IN_FLUX_VECTOR = True
+SATURATE_HEAT_FLUX = False
 SPITZER_CONDUCTIVITY = True
+HTC_HYPERDIFFUSION = 5e-2
 KAPPA0 = 1.0
 # KAPPA0 = 8e-12 # Hyperbolic conduction coefficient [W m-1 K-7/2]. Default value is Spitzer like (i.e. (8e-7 erg cm-1 s-1 K-7/2)).
 

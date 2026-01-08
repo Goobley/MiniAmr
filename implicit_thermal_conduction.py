@@ -69,7 +69,7 @@ def implicit_thermal_conduction(
     temperature = Q[ENE] * alpha
 
     # NOTE(cmo): Hack here at alpha too -- should be alpha=alpha
-    new_temperature = solve_step(temperature, xcc, x_int, dt, alpha=1.0)
+    new_temperature = solve_step(temperature, xcc, x_int, dt, alpha=alpha)
     delta_E = (new_temperature - temperature) / alpha
     Q[ENE] += delta_E
     Q_slice = Q[:, NUM_GHOST:-NUM_GHOST]
